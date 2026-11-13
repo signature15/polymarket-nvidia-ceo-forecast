@@ -20,8 +20,6 @@ QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
 # Standard normal quantiles
 Z = [-1.6448536, -0.6744898, 0.0, 0.6744898, 1.6448536]
 
-Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
-
 
 def clamp6(x: float) -> float:
     """Clamp to [0, 1] and round to 6 decimals."""
@@ -36,23 +34,27 @@ def estimate_vol_and_drift(prices: list[float], lookback: int = 240) -> tuple[fl
     if len(prices) < 2:
         return 0.0025, 0.0
 
-    tail = prices[-lookback:] if len(prices) >= lookback else prices
+    tail = prices[-lookback:]
     returns = [tail[i] - tail[i - 1] for i in range(1, len(tail))]
 
     if not returns:
         return 0.0025, 0.0
 
-    # EWMA variance with decay lambda = 0.94 (RiskMetrics style)
+    # EWMA variance with decay lambda = 0.94 (RiskMetrics style).
+    # Initialize with the mean of squared returns to avoid outlier-driven bias
+    # from a single seed value.
     lam = 0.94
-    var_ewma = returns[0] ** 2
-    for r in returns[1:]:
+    seed_window = min(10, len(returns))
+    var_ewma = sum(r ** 2 for r in returns[:seed_window]) / seed_window
+    for r in returns[seed_window:]:
         var_ewma = lam * var_ewma + (1 - lam) * r ** 2
 
     sigma = math.sqrt(var_ewma)  # per-minute std dev
 
-    # Drift: short-term (last 60 min) minus long-term (last 240 min) mean price
-    # Signals mean reversion tendency
-    short = sum(tail[-60:]) / len(tail[-60:]) if len(tail) >= 60 else tail[-1]
+    # Drift: short-term mean vs long-term mean signals mean reversion.
+    # Use all available short data rather than falling back to last price only.
+    short_tail = tail[-60:] if len(tail) >= 2 else tail
+    short = sum(short_tail) / len(short_tail)
     long_ = sum(tail) / len(tail)
     # Small mean-reversion pull toward long-term mean
     drift = (long_ - short) * 0.002  # very mild pull
@@ -75,29 +77,36 @@ def forecast_market(prices: list[float], horizon: int) -> list[list[float]]:
     # Minimum sigma floor (don't go lower than house baseline's 0.0025)
     sigma = max(sigma, 0.0025)
 
+    # Mean-reversion target is the long-term mean from estimation.
+    long_mean = sum(prices[-240:]) / len(prices[-240:]) if prices else x
+
     rows = []
-    mu = x  # running median estimate
     for h in range(1, horizon + 1):
-        # Drift accumulates (mean reversion)
-        mu_h = x + drift * h
+        # Exponential mean reversion: mu approaches long_mean asymptotically.
+        # Equivalent to AR(1) with coefficient (1 - 0.002)^h per step.
+        reversion_weight = 1.0 - (1.0 - 0.002) ** h
+        mu_h = x + reversion_weight * (long_mean - x)
         mu_h = min(1.0, max(0.0, mu_h))
 
         # Spread grows with sqrt(h) — Brownian motion scaling
         spread_h = sigma * math.sqrt(h)
 
+        # Boundary correction based on projected median mu_h, not fixed x.
+        # Compresses quantile spread near [0,1] boundaries where prices are bounded.
+        if 0.001 < mu_h < 0.999:
+            scale = min(mu_h, 1.0 - mu_h) / 0.5  # 1.0 at mu_h=0.5, near 0 at boundaries
+            scale = max(0.1, scale)
+        else:
+            scale = 0.1
+
         row = []
         for z in Z:
-            q = mu_h + z * spread_h
-            # Reflect at boundaries: prices near 0 or 1 have asymmetric distributions
-            # Use a simple logit-space approach for boundary correction
-            if 0.001 < x < 0.999:
-                # mild boundary correction: compress quantiles near bounds
-                scale = min(x, 1.0 - x) / 0.5  # 1.0 at x=0.5, near 0 at boundaries
-                scale = max(0.1, scale)
-                q = mu_h + z * spread_h * scale
+            q = mu_h + z * spread_h * scale
             row.append(clamp6(q))
 
-        # Ensure non-decreasing
+        # Ensure non-decreasing quantiles. When clamping forces a collapse,
+        # spread the tied values evenly between neighbours to preserve
+        # non-zero interval widths and avoid degenerate pinball loss.
         for i in range(1, len(row)):
             if row[i] < row[i - 1]:
                 row[i] = row[i - 1]
